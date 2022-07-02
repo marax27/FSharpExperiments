@@ -1,0 +1,790 @@
+#!markdown
+
+# Three-body problem: framework for the numerical simulation
+
+This notebook was created while attempting to answer a couple questions about planetary system simulations. Specifically: 3-body problem. Notable topics:
+- Solving a 3-body problem using a few numerical methods: Euler, Leapfrog, RK4, Midpoint.
+- How small should a time step be to keep the Moon-Earth system stable?
+- Is 4th order Runge-Kutta method better or worse than Leapfrog method? *Under what circumstances?*
+- How to compare different numerical methods: implementation of quality metrics.
+
+Most of the code below make up a framework for evaluating numerical methods. The below code supports a simulation involving 3 bodies, no more, no less. Some systems that can be simulated here: Sun-Earth-Moon system, Sun + 2 planets etc.
+
+## Typical workflow
+1. **Define a solar system, i.e. specify 3 bodies (mass, initial position and velocity etc.).** This can be achieved by defining a `ThreeBodySystem`, composed of 3 `Body` objects.
+2. **Define simulation settings (e.g. the timeframe, time step).** This is achieved by defining a `SolverSettings` object.
+3. **Run a simulation (or multiple simulations), using an integrator of choice.** Module `Simulation` provides a useful `runSimulationsInParallel()` function.
+4. **Analyse results:**
+    - plot 3D trajectories,
+    - calculate simulation metrics to estimate quality of the results.
+
+## Implementation details
+
+### Code modules
+The code is split into the following modules:
+- `LinearAlgebra` - basic vector operations.
+- `Domain` - physics-related data structures. For instance, it allows you to define a simple solar system.
+- `Presentation` - a wrapper on the [XPlot.Plotly](https://fslab.org/XPlot/) library. The module's goals are to plot standard 2D graphs, and plot body trajectories in 3D. It contains a submodule:
+    - `LayoutBuilder` - allows creation of more sophisticated 2D graphs.
+- `Integration` - implements numerical methods that are used during simulations.
+- `Simulation` - high-level wrapper on numerical methods.
+
+### Units of measure
+This exercise was an opportunity to test one of F#'s features: [Unit of measure](https://docs.microsoft.com/en-us/dotnet/fsharp/language-reference/units-of-measure). This feature allows a compiler to validate physical units used during calculation.
+
+Having implemented a few numerical methods, my opinion about units of measure is that:
+- they do **help avoiding simple mistakes**, like forgetting to multiply an expression by a time step,
+- they can get **quite tedious** to work with (see expressions like `<[<Measure>] 'l, [<Measure>] 't, [<Measure>] 'm>`),
+- error messages can be really confusing.
+
+## Simulation metrics
+It is useful to create metrics that can estimate a quality of a simulation. For example:
+- **Total energy** of the three-body system: ideally, it should remain constant. Any deviation is probably an error.
+- **Distance between 2 bodies** - one could pick such initial conditions that one body should follow a circular orbit around the other. Thus, distance between the 2 bodies should stay constant over time, and any distance deviation could be considered an error.
+
+For example, one can calculate a total energy (TE) of a three-body system at every step of the simulation, and plot the TE vs. time graph. The reasoning is: the better the numerical method, the less TE changes over time. In some cases, TE drops steadily (forward Euler, RK4), while sometimes it remains almost constant (barring some oscillations) for a long time (leapfrog).
+
+## Conclusions
+- Both RK4 and Leapfrog method are a reasonable choice for a numerical simulations. RK4 yields a smaller error when a simulation timeframe is short. However: if the simulation runs for a longer time, RK4's error will eventually grow larger than Leapfrog's.
+
+## Q&A
+
+> Q: Why 3 bodies?
+
+A: In my opinion $n=3$ strikes a good balance. It enables more complex behaviours (compared to $n=2$), but is still feasible to implement without looping through objects (compared to $n>3$).
+
+***
+
+#!markdown
+
+## Numerical methods
+
+Here is the description of numerical methods that were implemented in the notebook.
+
+Some theory (only a 3-body scenario is considered):
+- $\textbf{r}_i^n$ is a position vector of the $i$-th body at step $n$.
+- $\textbf{v}_i^n$ is a velocity vector of the $i$-th body at step $n$.
+- $\textbf{a}_i^n$ is an acceleration vector of the $i$-th body at step $n$.
+
+In the beginning of a simulation, a method knows the initial state (position and velocity) of each body: $\textbf{r}_i^0, \textbf{v}_i^0$.
+
+The $n$-th step of the simulation can be described using just 6 parameters:
+$$S^n = \left( \textbf{r}_1^n, \textbf{r}_2^n, \textbf{r}_3^n, \textbf{v}_1^n, \textbf{v}_2^n, \textbf{v}_3^n \right)$$
+
+It is helpful to consider a derivative of such state, $\dot{S}$:
+$$\dot{S}^n = \left( \textbf{v}_1^n, \textbf{v}_2^n, \textbf{v}_3^n, \textbf{a}_1^n, \textbf{a}_2^n, \textbf{a}_3^n \right)$$
+
+The first 3 components of $\dot{S}$ can be deduced from $S$. Acceleration components have to be calculated according to Newton's law of gravitation. For the acceleration of the first body:
+$$\textbf{a}_1^n
+= \frac{G m_2}{ \left|\left|\textbf{r}_{12}^n\right|\right|^3 } \textbf{r}_{12}^n
++ \frac{G m_3}{ \left|\left|\textbf{r}_{13}^n\right|\right|^3 } \textbf{r}_{13}^n$$
+
+where $\textbf{r}_{ij}^n = \textbf{r}_j^n - \textbf{r}_i^n$. As $G$ and masses are constant throughout the simulation, we can precompute the so-called [gravitational parameters](https://en.wikipedia.org/wiki/Standard_gravitational_parameter): $\mu_i = G m_i$. Thus:
+
+$$\textbf{a}_1^n
+= \frac{\mu_2}{ \left|\left|\textbf{r}_{12}^n\right|\right|^3 } \textbf{r}_{12}^n
++ \frac{\mu_3}{ \left|\left|\textbf{r}_{13}^n\right|\right|^3 } \textbf{r}_{13}^n$$
+
+Let's assume that derivative calculation is performed by the $f$ function:
+$$\dot{S}^n = f(S^n)$$
+
+In general, numerical methods calculate $\dot{S}^n$ in order to update $S^n$ and get $S^{n+1}$. The nuances depend on a method.
+
+The $S, \dot{S}$ notation is a bit more theoretical. In order to describe calculations that are closer to actual implementation, we'll use $\textbf{r}_i^n$, $\textbf{v}_i^n$, and $\textbf{a}_i^n$. Let's also define a function $A$ that calculates actual accelerations:
+
+$$\left( \textbf{a}_1^n, \textbf{a}_2^n, \textbf{a}_3^n \right) = A(\textbf{r}_1^n, \textbf{r}_2^n, \textbf{r}_3^n)$$
+
+$$A(\textbf{r}_1^n, \textbf{r}_2^n, \textbf{r}_3^n) = \left(
+  \frac{\mu_2}{ \left|\left|\textbf{r}_{12}^n\right|\right|^3 } \textbf{r}_{12}^n + \frac{\mu_3}{ \left|\left|\textbf{r}_{13}^n\right|\right|^3 } \textbf{r}_{13}^n,
+  \frac{\mu_1}{ \left|\left|\textbf{r}_{21}^n\right|\right|^3 } \textbf{r}_{21}^n + \frac{\mu_3}{ \left|\left|\textbf{r}_{23}^n\right|\right|^3 } \textbf{r}_{23}^n,
+  \frac{\mu_1}{ \left|\left|\textbf{r}_{31}^n\right|\right|^3 } \textbf{r}_{31}^n + \frac{\mu_2}{ \left|\left|\textbf{r}_{32}^n\right|\right|^3 } \textbf{r}_{32}^n
+\right)$$
+
+#!markdown
+
+### 1. Forward Euler method
+$$ S^{n+1} = S^n + \Delta t f(S^n) $$
+
+In other form:
+$$ \left( \textbf{a}_1^n, \textbf{a}_2^n, \textbf{a}_3^n \right) = A(\textbf{r}_1^n, \textbf{r}_2^n, \textbf{r}_3^n) $$
+$$ \textbf{r}^{n+1}_i = \textbf{r}^n_i + \Delta t \textbf{v}^{n}_i, \quad
+\textbf{v}^{n+1}_i = \textbf{v}^n_i + \Delta t \textbf{a}^{n}_i, \quad
+i=1,2,3 $$
+
+### 2. Midpoint method
+$$ \dot{S}^n = f(S^n) $$
+$$ S^\text{mid} = S^n + \frac{\Delta t}{2} \dot{S}^n $$
+$$ \dot{S}^\text{mid} = f(S^\text{mid}) $$
+$$ S^{n+1} = S^n + \Delta t \dot{S}^\text{mid} $$
+
+In other form:
+$$ \left( \textbf{a}_1^n, \textbf{a}_2^n, \textbf{a}_3^n \right) = A(\textbf{r}_1^n, \textbf{r}_2^n, \textbf{r}_3^n) $$
+$$ \textbf{r}^\text{mid}_i = \textbf{r}^n_i + \frac{\Delta t}{2} \textbf{v}_i^n, \quad
+\textbf{v}^\text{mid}_i = \textbf{v}^n_i + \frac{\Delta t}{2} \textbf{a}_i^n, \quad
+i=1,2,3 $$
+$$ \left( \textbf{a}_1^\text{mid}, \textbf{a}_2^\text{mid}, \textbf{a}_3^\text{mid} \right) = A(\textbf{r}_1^\text{mid}, \textbf{r}_2^\text{mid}, \textbf{r}_3^\text{mid}) $$
+$$ \textbf{r}^{n+1}_i = \textbf{r}^n_i + \Delta t \textbf{v}^\text{mid}_i, \quad
+\textbf{v}^{n+1}_i = \textbf{v}^n_i + \Delta t \textbf{a}^\text{mid}_i, \quad
+i=1,2,3 $$
+
+### 3. Fourth order Runge-Kutta (RK4)
+
+$$ k_1 = f(S^n), \quad
+k_2 = f(S^n + \frac{1}{2} \Delta t k_1), \quad
+k_3 = f(S^n + \frac{1}{2} \Delta t k_2), \quad
+k_4 = f(S^n + \Delta t k_3) $$
+
+$$ S^{n+1} = S^n + \frac{\Delta t}{6} (k_1 + 2k_2 + 2k_3 + k_4) $$
+
+In other form:
+
+*TODO*
+
+### 4. Leapfrog
+
+*TODO*
+
+In other form:
+
+**Before the proper calculations begin, the acceleration variable must be initialised:** $\left( \textbf{a}_1^\text{tmp}, \textbf{a}_2^\text{tmp}, \textbf{a}_3^\text{tmp} \right) := A(\textbf{r}_1^0, \textbf{r}_2^0, \textbf{r}_3^0)$
+
+$$ \textbf{v}^\text{mid}_i = \textbf{v}^n_i + \frac{\Delta t}{2}\textbf{a}^\text{tmp}_i, \quad i=1,2,3 $$
+$$ \textbf{r}^{n+1}_i = \textbf{r}^n_i + \Delta t \textbf{v}^\text{mid}_i, \quad i=1,2,3 $$
+$$ \left( \textbf{a}_1^\text{tmp}, \textbf{a}_2^\text{tmp}, \textbf{a}_3^\text{tmp} \right) := A(\textbf{r}^{n+1}_1, \textbf{r}^{n+1}_2, \textbf{r}^{n+1}_3) \quad \text{(update the variable)}$$
+$$ \textbf{v}^{n+1}_i = \textbf{v}^\text{mid}_i + \frac{\Delta t}{2}\textbf{a}^\text{tmp}_i, \quad i=1,2,3 $$
+
+### 5. Velocity Verlet
+
+*TODO*
+
+In other form:
+
+**Just like in the case of Leapfrog method, acceleration variable must also be initialised.**
+
+$$ \textbf{r}^{n+1}_i = \textbf{r}^n_i + \Delta t \left( \textbf{v}^n_i + \frac{\Delta t}{2} \textbf{a}^\text{tmp}_i \right), \quad i=1,2,3 $$
+$$ \textbf{a}^{n+1}_i = A(\textbf{r}^{n+1}_1, \textbf{r}^{n+1}_2, \textbf{r}^{n+1}_3), \quad i=1,2,3 $$
+$$ \textbf{v}^{n+1}_i = \textbf{v}^n_i + \Delta t \frac{\textbf{a}^\text{tmp}_i + \textbf{a}^{n+1}_i}{2}, \quad i=1,2,3 $$
+$$ \textbf{a}^\text{tmp}_i := \textbf{a}^{n+1}_i, \quad i=1,2,3 $$
+
+***
+
+#!fsharp
+
+#r "nuget: XPlot.Plotly, 4.0.6"
+#r "nuget: XPlot.Plotly.Interactive, 4.0.6"
+
+#!fsharp
+
+module LinearAlgebra =
+
+    type Vector3<[<Measure>] 'u> =
+        { x : float<'u>; y : float<'u>; z : float<'u>}
+
+        member this.squaredMagnitude() =
+            this.x * this.x + this.y * this.y + this.z * this.z
+
+        member this.magnitude() =
+            let magnitude = (this.squaredMagnitude() |> float) ** 0.5
+            (box magnitude) :?> float<'u>
+
+        static member (+) (v: Vector3<'v>, u: Vector3<'v>) =
+            { x = v.x + u.x; y = v.y + u.y; z = v.z + u.z }
+
+        static member (-) (v: Vector3<'v>, u: Vector3<'v>) =
+            { x = v.x - u.x; y = v.y - u.y; z = v.z - u.z }
+
+        static member (*) (v: Vector3<'v>, scalar: float<'s>) =
+            { x = v.x * scalar; y = v.y * scalar; z = v.z * scalar }
+
+        static member (*) (scalar: float<'s>, v: Vector3<'v>) =
+            v * scalar
+
+        static member (/) (v: Vector3<'v>, scalar: float<'s>) =
+            { x = v.x / scalar; y = v.y / scalar; z = v.z / scalar }
+
+        static member (~-) (v: Vector3<'v>) =
+            { x = -v.x; y = -v.y; z = -v.z }
+
+        static member (~+) (v: Vector3<'v>) =
+            { x = +v.x; y = +v.y; z = +v.z }
+
+    // A helper factory function.
+    let vector3 x y z = { x=x; y=y; z=z }
+
+module Domain =
+    open LinearAlgebra
+
+    type Body<[<Measure>] 'l, [<Measure>] 't, [<Measure>] 'm> = {
+        Name: string
+        Mass: float<'m>
+        R: Vector3<'l>
+        V: Vector3<'l/'t>
+    }
+
+    type ThreeBodySystem<[<Measure>] 'l, [<Measure>] 't, [<Measure>] 'm> = {
+        Bodies: Body<'l,'t,'m> * Body<'l,'t,'m> * Body<'l,'t,'m>
+    }
+
+    type Trajectory<[<Measure>] 'l, [<Measure>] 't> = {
+        Name: string
+        T: float<'t> array
+        R: Vector3<'l> array
+        V: Vector3<'l/'t> array
+    }
+
+module Presentation =
+    open XPlot.Plotly
+    open LinearAlgebra
+    open Domain
+
+    type Series2D<[<Measure>] 'x, [<Measure>] 'y> =
+        { Name: string; X: float<'x> array; Y: float<'y> array }
+
+        static member map yMapper series2D =
+            let newYs = series2D.Y |> Array.map yMapper
+            { Name = series2D.Name; X = series2D.X; Y = newYs }
+
+    let private projectX (vectors: Vector3<'a> array) = vectors |> Array.map (fun v -> v.x)
+    let private projectY (vectors: Vector3<'a> array) = vectors |> Array.map (fun v -> v.y)
+    let private projectZ (vectors: Vector3<'a> array) = vectors |> Array.map (fun v -> v.z)
+
+    let private asScatter2d series =
+        Scatter(x = series.X, y = series.Y, name = series.Name)
+
+    let private asScatter3d trajectory =
+        Scatter3d(
+            x = projectX trajectory.R,
+            y = projectY trajectory.R,
+            z = projectZ trajectory.R,
+            name = trajectory.Name,
+            text = trajectory.T,
+            marker = Marker(size=1.0)
+        )
+
+    let plot2D series =
+        series
+        |> Seq.map asScatter2d
+        |> Chart.Plot
+        |> Chart.WithLegend true
+
+    let plot3D trajectories =
+        trajectories
+        |> Seq.map asScatter3d
+        |> Chart.Plot
+        |> Chart.WithLegend true
+
+
+    module LayoutBuilder =
+        type Builder =
+            {
+                xAxisType: string
+                yAxisType: string
+                xLabel: string
+                yLabel: string
+                title: string
+            }
+
+            member this.build() =
+                new Layout(
+                    xaxis = Xaxis(``type``=this.xAxisType, title=this.xLabel, autorange=true),
+                    yaxis = Yaxis(``type``=this.yAxisType, title=this.yLabel, autorange=true),
+                    title = this.title,
+                    showlegend = true
+                )
+
+        let create () = { xAxisType = ""; yAxisType = ""; xLabel = ""; yLabel = ""; title = "" }
+
+        let withLogX builder = { builder with xAxisType = "log" }
+        let withLogY builder = { builder with yAxisType = "log" }
+        let withXLabel label builder = { builder with xLabel = label }
+        let withYLabel label builder = { builder with yLabel = label }
+        let withTitle plotTitle builder = { builder with title = plotTitle }
+
+        let build (builder: Builder) = builder.build()
+
+#!fsharp
+
+// 2D Plot showcase
+
+open LinearAlgebra
+open Domain
+open Presentation
+
+let s = {
+    Name = "f(x)"
+    X = [| 1.0; 2.0; 3.0; 4.0; 5.0; 6.0; 7.0 |]
+    Y = [| 5.0; 1.5; 0.9; 0.75; 0.72; 0.8; 1.0 |]
+}
+
+let s1 = { (s |> Series2D.map (fun y -> -y)) with Name = "-f(x)" }
+let s2 = { (s |> Series2D.map (fun y -> 1.0/y)) with Name = "1/f(x)" }
+
+plot2D [s; s1; s2]
+
+#!fsharp
+
+module Integration =
+    open Domain
+    open LinearAlgebra
+
+    type SolverSettings<[<Measure>] 'l, [<Measure>] 't, [<Measure>] 'm> = {
+        TStart: float<'t>
+        TEnd: float<'t>
+        DeltaT: float<'t>
+        GravitationalConstant: float<'l^3*'m^-1*'t^-2>
+    }
+
+    type ThreeVectors<[<Measure>] 'u, [<Measure>] 't> =
+        { Values: Vector3<'u> * Vector3<'u> * Vector3<'u> }
+
+        member this.advance (derivative: ThreeVectors<'u/'t, 't>, step: float<'t>) =
+            let (x1, x2, x3) = this.Values
+            let (dx1, dx2, dx3) = derivative.Values
+            { Values = (x1 + dx1 * step, x2 + dx2 * step, x3 + dx3 * step) }
+
+        member this.meanWith (other: ThreeVectors<'u, 't>) =
+            let (x1, x2, x3) = this.Values
+            let (o1, o2, o3) = other.Values
+            { Values = (0.5 * (x1 + o1), 0.5 * (x2 + o2), 0.5 * (x3 + o3)) }
+
+    let private calculateAccelerations<[<Measure>] 'l, [<Measure>] 't>
+        (R: ThreeVectors<'l, 't>)
+        (gravitationalParameters: (float<'l^3/'t^2> * float<'l^3/'t^2> * float<'l^3/'t^2>))
+        : ThreeVectors<'l/'t^2, 't> =
+
+        let power (squaredMagnitude: float<'l^2>) : float<'l^-3> =
+            let result = (float squaredMagnitude) ** -1.5
+            ((box result) :?> float<'l^-3>)
+
+        let (R1, R2, R3) = R.Values
+        let (mu1, mu2, mu3) = gravitationalParameters
+
+        let (offset1_2, offset1_3, offset2_3) = (R2 - R1, R3 - R1, R3 - R2)
+        let coef1_2 = offset1_2.squaredMagnitude() |> power
+        let coef1_3 = offset1_3.squaredMagnitude() |> power
+        let coef2_3 = offset2_3.squaredMagnitude() |> power
+
+        let a1 = mu2 * coef1_2 * offset1_2 + mu3 * coef1_3 * offset1_3
+        let a2 = -mu1 * coef1_2 * offset1_2 + mu3 * coef2_3 * offset2_3
+        let a3 = -mu1 * coef1_3 * offset1_3 - mu2 * coef2_3 * offset2_3
+
+        { Values = (a1, a2, a3) }
+
+
+    type SolutionStep<[<Measure>] 'l, [<Measure>] 't> = { T: float<'t>; R: ThreeVectors<'l, 't>; V: ThreeVectors<'l/'t, 't> }
+
+    let solveForwardEuler<[<Measure>] 'l, [<Measure>] 't, [<Measure>] 'm>
+        (solverSettings: SolverSettings<'l,'t,'m>)
+        (celestialSystem: ThreeBodySystem<'l,'t,'m>)
+        : SolutionStep<'l,'t> array =
+
+        let G = solverSettings.GravitationalConstant
+        let dt = solverSettings.DeltaT
+        let (b1, b2, b3) = celestialSystem.Bodies
+        let gravitationalParameters = (b1.Mass * G, b2.Mass * G, b3.Mass * G)
+
+        let N = int ((solverSettings.TEnd - solverSettings.TStart) / dt)
+        let initialStep = { T = solverSettings.TStart; R = { Values = b1.R, b2.R, b3.R }; V = { Values = b1.V, b2.V, b3.V } }
+
+        seq {
+            yield initialStep
+            yield! (0, initialStep)
+            |> Seq.unfold (fun (index, step) ->
+                if index >= N then None
+                else
+                    let A = calculateAccelerations step.R gravitationalParameters
+                    let newStep = {
+                        T = solverSettings.TStart + dt * (float index + 1.0)
+                        R = step.R.advance(step.V, dt)
+                        V = step.V.advance(A, dt)
+                    }
+                    Some (newStep, (index + 1, newStep))
+                )
+        } |> Seq.toArray
+
+    let solveMidpoint<[<Measure>] 'l, [<Measure>] 't, [<Measure>] 'm>
+        (solverSettings: SolverSettings<'l,'t,'m>)
+        (celestialSystem: ThreeBodySystem<'l,'t,'m>)
+        : SolutionStep<'l,'t> array =
+
+        let G = solverSettings.GravitationalConstant
+        let dt = solverSettings.DeltaT
+        let (b1, b2, b3) = celestialSystem.Bodies
+        let gravitationalParameters = (b1.Mass * G, b2.Mass * G, b3.Mass * G)
+
+        let N = int ((solverSettings.TEnd - solverSettings.TStart) / dt)
+        let initialStep = { T = solverSettings.TStart; R = { Values = b1.R, b2.R, b3.R }; V = { Values = b1.V, b2.V, b3.V } }
+        let dt1_2 = 0.5 * dt
+
+        seq {
+            yield initialStep
+            yield! (0, initialStep)
+            |> Seq.unfold (fun (index, step) ->
+                if index >= N then None
+                else
+                    let A = calculateAccelerations step.R gravitationalParameters
+                    let R_mid = step.R.advance(step.V, dt1_2)
+                    let V_mid = step.V.advance(A, dt1_2)
+                    let A_mid = calculateAccelerations R_mid gravitationalParameters
+                    let newStep = {
+                        T = solverSettings.TStart + dt * (float index + 1.0)
+                        R = step.R.advance(V_mid, dt)
+                        V = step.V.advance(A_mid, dt)
+                    }
+                    Some (newStep, (index + 1, newStep))
+            )
+        } |> Seq.toArray
+
+    let solveRK4<[<Measure>] 'l, [<Measure>] 't, [<Measure>] 'm>
+        (solverSettings: SolverSettings<'l,'t,'m>)
+        (celestialSystem: ThreeBodySystem<'l,'t,'m>)
+        : SolutionStep<'l,'t> array =
+
+        let G = solverSettings.GravitationalConstant
+        let dt = solverSettings.DeltaT
+        let (b1, b2, b3) = celestialSystem.Bodies
+        let gravitationalParameters = (b1.Mass * G, b2.Mass * G, b3.Mass * G)
+
+        let N = int ((solverSettings.TEnd - solverSettings.TStart) / dt)
+        let initialStep = { T = solverSettings.TStart; R = { Values = b1.R, b2.R, b3.R }; V = { Values = b1.V, b2.V, b3.V } }
+        let dt1_2 = 0.5 * dt
+
+        let inline weighK k1 k2 k3 k4 =
+            let (k11, k12, k13) = k1.Values
+            let (k21, k22, k23) = k2.Values
+            let (k31, k32, k33) = k3.Values
+            let (k41, k42, k43) = k4.Values
+            {
+                Values = (
+                    (k11 + 2.0 * k21 + 2.0 * k31 + k41) / 6.0,
+                    (k12 + 2.0 * k22 + 2.0 * k32 + k42) / 6.0,
+                    (k13 + 2.0 * k23 + 2.0 * k33 + k43) / 6.0
+                )
+            }
+
+
+        seq {
+            yield initialStep
+            yield! (0, initialStep)
+            |> Seq.unfold (fun (index, step) ->
+                if index >= N then None
+                else
+                    let k1V = step.V
+                    let k1A = calculateAccelerations step.R gravitationalParameters
+
+                    let k2V = step.V.advance(k1A, dt1_2)
+                    let k2A = calculateAccelerations (step.R.advance(k1V, dt1_2)) gravitationalParameters
+
+                    let k3V = step.V.advance(k2A, dt1_2)
+                    let k3A = calculateAccelerations (step.R.advance(k2V, dt1_2)) gravitationalParameters
+
+                    let k4V = step.V.advance(k3A, dt)
+                    let k4A = calculateAccelerations (step.R.advance(k3V, dt)) gravitationalParameters
+
+                    let rWeight = weighK k1V k2V k3V k4V
+                    let vWeight = weighK k1A k2A k3A k4A
+                    let newStep = {
+                        T = solverSettings.TStart + dt * (float index + 1.0)
+                        R = step.R.advance(rWeight, dt)
+                        V = step.V.advance(vWeight, dt)
+                    }
+                    Some (newStep, (index + 1, newStep))
+            )
+        } |> Seq.toArray
+
+    let solveLeapfrog<[<Measure>] 'l, [<Measure>] 't, [<Measure>] 'm>
+        (solverSettings: SolverSettings<'l,'t,'m>)
+        (celestialSystem: ThreeBodySystem<'l,'t,'m>)
+        : SolutionStep<'l,'t> array =
+
+        let G = solverSettings.GravitationalConstant
+        let dt = solverSettings.DeltaT
+        let (b1, b2, b3) = celestialSystem.Bodies
+        let gravitationalParameters = (b1.Mass * G, b2.Mass * G, b3.Mass * G)
+
+        let N = int ((solverSettings.TEnd - solverSettings.TStart) / dt)
+        let initialStep = { T = solverSettings.TStart; R = { Values = b1.R, b2.R, b3.R }; V = { Values = b1.V, b2.V, b3.V } }
+        let dt1_2 = 0.5 * dt
+
+        let mutable A = calculateAccelerations initialStep.R gravitationalParameters
+
+        seq {
+            yield initialStep
+            yield! (0, initialStep)
+            |> Seq.unfold (fun (index, step) ->
+                if index >= N then None
+                else
+                    let V_mid = step.V.advance(A, dt1_2)
+                    let R1 = step.R.advance(V_mid, dt)
+                    A <- calculateAccelerations R1 gravitationalParameters
+                    let V1 = V_mid.advance(A, dt1_2)
+
+                    let newStep = {
+                        T = solverSettings.TStart + dt * (float index + 1.0)
+                        R = R1
+                        V = V1
+                    }
+                    Some (newStep, (index + 1, newStep))
+            )
+        } |> Seq.toArray
+
+    let solveVelocityVerlet<[<Measure>] 'l, [<Measure>] 't, [<Measure>] 'm>
+        (solverSettings: SolverSettings<'l,'t,'m>)
+        (celestialSystem: ThreeBodySystem<'l,'t,'m>)
+        : SolutionStep<'l,'t> array =
+
+        let G = solverSettings.GravitationalConstant
+        let dt = solverSettings.DeltaT
+        let (b1, b2, b3) = celestialSystem.Bodies
+        let gravitationalParameters = (b1.Mass * G, b2.Mass * G, b3.Mass * G)
+
+        let N = int ((solverSettings.TEnd - solverSettings.TStart) / dt)
+        let initialStep = { T = solverSettings.TStart; R = { Values = b1.R, b2.R, b3.R }; V = { Values = b1.V, b2.V, b3.V } }
+        let dt1_2 = 0.5 * dt
+
+        let mutable A = calculateAccelerations initialStep.R gravitationalParameters
+
+        seq {
+            yield initialStep
+            yield! (0, initialStep)
+            |> Seq.unfold (fun (index, step) ->
+                if index >= N then None
+                else
+                    let V1 = step.V.advance(A, dt1_2)
+                    let R1 = step.R.advance(V1, dt)
+                    let A1 = calculateAccelerations R1 gravitationalParameters
+                    let V1 = step.V.advance(A.meanWith(A1), dt)
+                    A <- A1
+
+                    let newStep = {
+                        T = solverSettings.TStart + dt * (float index + 1.0)
+                        R = R1
+                        V = V1
+                    }
+                    Some (newStep, (index + 1, newStep))
+            )
+        } |> Seq.toArray
+
+#!fsharp
+
+module Simulation =
+    // Wrappers on the numerical methods.
+
+    open Domain
+    open Integration
+
+    type SimulationSolver = ForwardEulerSolver | MidpointSolver | RK4Solver | LeapfrogSolver | VelocityVerletSolver
+
+    let private solverMap<[<Measure>] 'l, [<Measure>] 't, [<Measure>] 'm> =
+        function
+        | ForwardEulerSolver -> (solveForwardEuler<'l,'t,'m>, "Forward Euler")
+        | MidpointSolver -> (solveMidpoint<'l,'t,'m>, "Midpoint")
+        | RK4Solver -> (solveRK4<'l,'t,'m>, "RK4")
+        | LeapfrogSolver -> (solveLeapfrog<'l,'t,'m>, "Leapfrog")
+        | VelocityVerletSolver -> (solveVelocityVerlet<'l,'t,'m>, "Velocity Verlet")
+
+    type SimulationResult<[<Measure>] 'l, [<Measure>] 't, [<Measure>] 'm> = {
+        SolverName: string
+        System: ThreeBodySystem<'l, 't, 'm>
+        Settings: SolverSettings<'l, 't, 'm>
+        Solution: SolutionStep<'l,'t> array
+    }
+
+    let runSimulationsInParallel<[<Measure>] 'l, [<Measure>] 't, [<Measure>] 'm>
+        (presets: seq<SimulationSolver * SolverSettings<'l, 't, 'm> * ThreeBodySystem<'l, 't, 'm>>)
+        : array<SimulationResult<'l, 't, 'm>> =
+
+        presets
+        |> Seq.map (fun (solverType, settings, system) -> async {
+                let (solve, methodName) = solverMap<'l, 't, 'm> solverType
+                let solution = solve settings system
+                return { SolverName = methodName; System = system; Settings = settings; Solution = solution }
+            }
+        )
+        |> Async.Parallel
+        |> Async.RunSynchronously
+
+    let asTrajectories<[<Measure>] 'l, [<Measure>] 't, [<Measure>] 'm>
+        (result: SimulationResult<'l, 't, 'm>)
+        : Trajectory<'l,'t> array =
+
+        let steps = result.Solution
+        let settings = result.Settings
+        let (b1, b2, b3) = result.System.Bodies
+
+        let T = steps |> Array.mapi (fun index _ -> settings.TStart + (float index) * settings.DeltaT)
+        [|
+            { Name = b1.Name; T = T; R = (steps |> Array.map (fun {R={Values=(r1,_,_)}} -> r1)); V = (steps |> Array.map (fun {V={Values=(v1,_,_)}} -> v1)) }
+            { Name = b2.Name; T = T; R = (steps |> Array.map (fun {R={Values=(_,r2,_)}} -> r2)); V = (steps |> Array.map (fun {V={Values=(_,v2,_)}} -> v2)) }
+            { Name = b3.Name; T = T; R = (steps |> Array.map (fun {R={Values=(_,_,r3)}} -> r3)); V = (steps |> Array.map (fun {V={Values=(_,_,v3)}} -> v3)) }
+        |]
+
+    let applyMetric<[<Measure>] 'l, [<Measure>] 't, [<Measure>] 'm, [<Measure>] 'metric>
+        (predicate: SolutionStep<'l, 't> -> float<'metric>)
+        (result: SimulationResult<'l, 't, 'm>)
+        : array<float<'t>> * array<float<'metric>> =
+
+        (
+            result.Solution |> Array.map (fun step -> step.T),
+            result.Solution |> Array.map predicate
+        )
+
+#!fsharp
+
+module EarthMoonScenario =
+
+    open Domain
+    open LinearAlgebra
+    open Integration
+    open FSharp.Data.UnitSystems.SI.UnitSymbols
+
+    // Units of measure used in this scenario.
+    [<Measure>] type mEarth // 5.972e24<kg>
+    [<Measure>] type rMoon // 3.844e8<m>
+    [<Measure>] type day
+
+    // Calculate gravitational constant for the units specified above.
+    let GravitationalConstant =
+        let G_SI = 6.6743e-11<m^3/kg/s^2>
+        let rMoonConversion = 3.844e8<m/rMoon>
+        let mEarthConversion = 5.972e24<kg/mEarth>
+        let dayConversion = 86400.0<s/day>
+        G_SI/rMoonConversion/rMoonConversion/rMoonConversion*mEarthConversion*dayConversion*dayConversion
+
+    let SimulationSettings = { DeltaT = 1.0<day>; TStart = 0.0<day>; TEnd = 30.0 * 365.0<day>; GravitationalConstant = GravitationalConstant }
+
+    let ThreeBodySystem = {
+        Bodies = (
+            {
+                Name = "Sun"
+                Mass = 3.331e05<mEarth>
+                R = vector3 0.0<rMoon> 0.0<rMoon> 0.0<rMoon>
+                V = vector3 0.0<rMoon/day> 0.0<rMoon/day> 0.0<rMoon/day>
+            },
+            {
+                Name = "Earth"
+                Mass = 1.0<mEarth>
+                R = vector3 3.892e2<rMoon> 0.0<rMoon> 0.0<rMoon>
+                V = vector3 0.0<rMoon/day> 6.694711<rMoon/day> 0.0<rMoon/day>
+            },
+            {
+                Name = "Moon"
+                Mass = 1.23e-2<mEarth>
+                R = vector3 3.892e2<rMoon> 1.0<rMoon> 0.0<rMoon>
+                V = vector3 -0.229971<rMoon/day> 6.694711<rMoon/day> 0.0<rMoon/day>
+            }
+        )
+    }
+
+    let evaluateMoonOrbitDeviation {R={Values=(_,r2,r3)}} =
+        let deviation = (r3 - r2).magnitude() - 1.0<rMoon>
+        abs deviation
+
+open Simulation
+open Presentation
+
+let solvers = [ RK4Solver; MidpointSolver; LeapfrogSolver ]
+
+let results = solvers
+            |> Seq.map (fun solver -> (solver, EarthMoonScenario.SimulationSettings, EarthMoonScenario.ThreeBodySystem))
+            |> runSimulationsInParallel
+
+results[0]
+|> asTrajectories
+|> plot3D
+
+#!fsharp
+
+open Presentation
+open Simulation
+open XPlot.Plotly
+
+// module Helpers =
+//     let subset (min, max) items =
+//         items
+//         |> Seq.skip min
+//         |> Seq.take (max - min)
+//         |> Seq.toList
+
+//     let arithmeticMean<[<Measure>] 'u> (items: float<'u> list) =
+//         items |> List.average
+
+//     let reduceResolution<[<Measure>] 'u> (windowLength: int) (items: float<'u> array) =
+//         let N = (items |> Array.length) / windowLength
+//         { 0 .. N-1 }
+//         // |> Seq.map (fun idx -> (subset (idx*windowLength, (idx+1)*windowLength) items) |> arithmeticMean)
+//         // |> Seq.map (fun idx -> (subset (idx*windowLength, (idx+1)*windowLength) items) |> Seq.head)
+//         |> Seq.map (fun idx -> items.[idx])
+//         |> Seq.toArray
+
+let allSeries = seq {
+    for result in results do
+        let (b1, b2, b3) = result.System.Bodies
+        let name = $"{result.SolverName}: Δ|{b3.Name}-{b2.Name}|"
+        let (xMetric, yMetric) = applyMetric EarthMoonScenario.evaluateMoonOrbitDeviation result
+        yield { Name=name; X=xMetric; Y=yMetric }
+}
+
+let layout = LayoutBuilder.create()
+            |> LayoutBuilder.withLogY
+            |> LayoutBuilder.withXLabel "Time [year]"
+            |> LayoutBuilder.withYLabel "Orbit radius deviation"
+            |> LayoutBuilder.withTitle "Orbit radius metric"
+            |> LayoutBuilder.build
+
+allSeries
+|> plot2D
+|> Chart.WithLayout layout
+|> Chart.WithSize (1200, 720)
+
+#!fsharp
+
+open Presentation
+open Integration
+open XPlot.Plotly
+
+let calculateKineticEnergy<[<Measure>] 'l, [<Measure>] 't, [<Measure>] 'm>
+    ({ V = { Values = (v1, v2, v3) } }: SolutionStep<'l,'t>)
+    ((m1, m2, m3): float<'m> * float<'m> * float<'m>) =
+
+    0.5 * (m1 * v1.squaredMagnitude() + m2 * v2.squaredMagnitude() + m3 * v3.squaredMagnitude())
+
+let calculatePotentialEnergy<[<Measure>] 'l, [<Measure>] 't, [<Measure>] 'm>
+    ({ R = { Values = (r1, r2, r3) } }: SolutionStep<'l,'t>)
+    ({ GravitationalConstant = G }: SolverSettings<'l,'t,'m>)
+    ((m1, m2, m3): float<'m> * float<'m> * float<'m>) =
+
+    -G*m1*m2/(r2 - r1).magnitude() - G*m1*m3/(r3 - r1).magnitude() - G*m2*m3/(r3 - r2).magnitude()
+
+let calculateTotalEnergy<[<Measure>] 'l, [<Measure>] 't, [<Measure>] 'm> masses settings step =
+    (calculateKineticEnergy step masses) + (calculatePotentialEnergy step settings masses)
+
+
+let allSeries = seq {
+    for result in results do
+        let (b1,b2,b3) = result.System.Bodies
+        let M = (b1.Mass, b2.Mass, b3.Mass)
+        let timeSeries = result.Solution |> Array.map (fun {T=t} -> t)
+        let dt = result.Settings.DeltaT
+
+        let E0 = calculateTotalEnergy M result.Settings result.Solution.[0]
+
+        let calculateEnergyDeviation step =
+            let E = (calculateTotalEnergy M result.Settings step)
+            abs (E - E0)
+
+        let (xMetric, yMetric) = applyMetric calculateEnergyDeviation result
+        let name = $"Δ|E_total| ({result.SolverName})"
+        yield { Name=name; X=xMetric; Y=yMetric }
+}
+
+let layout = LayoutBuilder.create()
+            |> LayoutBuilder.withLogY
+            |> LayoutBuilder.withXLabel "Time"
+            |> LayoutBuilder.withYLabel "Absolute energy deviation"
+            |> LayoutBuilder.withTitle "Total energy metric"
+
+allSeries
+|> plot2D
+|> Chart.WithLayout (layout.build())
+|> Chart.WithSize (1200, 720)
